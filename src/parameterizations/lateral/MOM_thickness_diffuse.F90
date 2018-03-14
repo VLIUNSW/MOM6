@@ -343,7 +343,7 @@ subroutine thickness_diffuse(h, uhtr, vhtr, tv, dt, G, GV, MEKE, VarMix, CDp, CS
     if (CS%id_KH_u1 > 0)  call post_data(CS%id_KH_u1, KH_u(:,:,1), CS%diag)
     if (CS%id_KH_v1 > 0)  call post_data(CS%id_KH_v1, KH_v(:,:,1), CS%diag)
     if (CS%id_hrmv > 0)   call post_data(CS%id_hrmv, HRMv, CS%diag)
-    !if (CS%id_hrmu > 0)   call post_data(CS%id_hrmu, HRMu, CS%diag)
+    if (CS%id_hrmu > 0)   call post_data(CS%id_hrmu, HRMu, CS%diag)
 
     ! Diagnose diffusivity at T-cell point.  Do simple average, rather than
     ! thickness-weighted average, in order that KH_t is depth-independent
