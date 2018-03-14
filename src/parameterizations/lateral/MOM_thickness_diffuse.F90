@@ -64,6 +64,7 @@ type, public :: thickness_diffuse_CS ; private
   integer :: id_KH_u1   = -1, id_KH_v1   = -1, id_KH_t1  = -1
   integer :: id_slope_x = -1, id_slope_y = -1
   integer :: id_sfn_unlim_x = -1, id_sfn_unlim_y = -1, id_sfn_x = -1, id_sfn_y = -1
+  integer :: id_hrmu    = -1, id_hrmv    = -1
   !>@}
 end type thickness_diffuse_CS
 
@@ -72,7 +73,7 @@ contains
 !> Calculates thickness diffusion coefficients and applies thickness diffusion to layer
 !! thicknesses, h. Diffusivities are limited to ensure stability.
 !! Also returns along-layer mass fluxes used in the continuity equation.
-subroutine thickness_diffuse(h, uhtr, vhtr, tv, dt, G, GV, MEKE, VarMix, CDp, CS)
+subroutine thickness_diffuse(h, uhtr, vhtr, tv, dt, G, GV, MEKE, VarMix, CDp, CS, u, v)
   type(ocean_grid_type),                     intent(in)    :: G      !< Ocean grid structure
   type(verticalGrid_type),                   intent(in)    :: GV     !< Vertical grid structure
   real, dimension(SZI_(G),SZJ_(G),SZK_(G)),  intent(inout) :: h      !< Layer thickness (m or kg/m2)
@@ -84,6 +85,14 @@ subroutine thickness_diffuse(h, uhtr, vhtr, tv, dt, G, GV, MEKE, VarMix, CDp, CS
   type(VarMix_CS),                           pointer       :: VarMix !< Variable mixing coefficients
   type(cont_diag_ptrs),                      intent(inout) :: CDp    !< Diagnostics for the continuity equation
   type(thickness_diffuse_CS),                pointer       :: CS     !< Control structure for thickness diffusion
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(G)), intent(inout) :: u
+  real, dimension(SZI_(G),SZJB_(G),SZK_(G)), intent(inout) :: v
+  !type(MOM_state_type),                  pointer       :: MOM_CS   !< Control structure from initialize_MOM
+
+  ! Local variable
+  real, dimension(SZI_(G),SZJB_(G),SZK_(G))   :: HRMu
+  real, dimension(SZI_(G),SZJB_(G),SZK_(G))   :: HRMv
+
   ! Local variables
   real :: e(SZI_(G), SZJ_(G), SZK_(G)+1) ! heights of interfaces, relative to mean
                                          ! sea level,in H units, positive up.
@@ -302,14 +311,17 @@ subroutine thickness_diffuse(h, uhtr, vhtr, tv, dt, G, GV, MEKE, VarMix, CDp, CS
       call hchksum(tv%S, "thickness_diffuse S", G%HI, haloshift=1)
     endif
   endif
+  
 
   ! Calculate uhD, vhD from h, e, KH_u, KH_v, tv%T/S
   if (use_stored_slopes) then
     call thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV, MEKE, CS, &
                                 int_slope_u, int_slope_v, VarMix%slope_x, VarMix%slope_y)
+    call HRM_transport(G,GV,h,e,tv,u,v,CS,dt, HRMu,HRMv,VarMix%slope_x,VarMix%slope_y)
   else
     call thickness_diffuse_full(h, e, Kh_u, Kh_v, tv, uhD, vhD, cg1, dt, G, GV, MEKE, CS, &
                                 int_slope_u, int_slope_v)
+    call HRM_transport(G,GV,h,e,tv,u,v,CS,dt, HRMu,HRMv)
   endif
 
   if (associated(MEKE) .AND. ASSOCIATED(VarMix)) then
@@ -330,6 +342,8 @@ subroutine thickness_diffuse(h, uhtr, vhtr, tv, dt, G, GV, MEKE, VarMix, CDp, CS
     if (CS%id_KH_v > 0)   call post_data(CS%id_KH_v, KH_v, CS%diag)
     if (CS%id_KH_u1 > 0)  call post_data(CS%id_KH_u1, KH_u(:,:,1), CS%diag)
     if (CS%id_KH_v1 > 0)  call post_data(CS%id_KH_v1, KH_v(:,:,1), CS%diag)
+    if (CS%id_hrmv > 0)   call post_data(CS%id_hrmv, HRMv, CS%diag)
+    !if (CS%id_hrmu > 0)   call post_data(CS%id_hrmu, HRMu, CS%diag)
 
     ! Diagnose diffusivity at T-cell point.  Do simple average, rather than
     ! thickness-weighted average, in order that KH_t is depth-independent
@@ -363,6 +377,7 @@ subroutine thickness_diffuse(h, uhtr, vhtr, tv, dt, G, GV, MEKE, VarMix, CDp, CS
 
   endif
 
+
   !$OMP parallel do default(none) shared(is,ie,js,je,nz,uhtr,uhD,dt,vhtr,CDp,vhD,h,G,GV)
   do k=1,nz
     do j=js,je ; do I=is-1,ie
@@ -370,7 +385,8 @@ subroutine thickness_diffuse(h, uhtr, vhtr, tv, dt, G, GV, MEKE, VarMix, CDp, CS
       if (ASSOCIATED(CDp%uhGM)) CDp%uhGM(I,j,k) = uhD(I,j,k)
     enddo ; enddo
     do J=js-1,je ; do i=is,ie
-      vhtr(i,J,k) = vhtr(i,J,k) + vhD(i,J,k)*dt
+      !vhD(i,J,k) = vhD(i,J,k) + HRMv(i,J,K)
+      vhtr(i,J,k) = vhtr(i,J,k) + vhD(i,J,k)*dt 
       if (ASSOCIATED(CDp%vhGM)) CDp%vhGM(i,J,k) = vhD(i,J,k)
     enddo ; enddo
     do j=js,je ; do i=is,ie
@@ -1811,6 +1827,13 @@ subroutine thickness_diffuse_init(Time, G, GV, param_file, diag, CDp, CS)
   CS%id_sfn_unlim_y =  register_diag_field('ocean_model', 'GM_sfn_unlim_y', diag%axesCvi, Time, &
            'Parameterized Meridional Overturning Streamfunction before limiting/smoothing', 'm3 s-1')
 
+  CS%id_hrmu = register_diag_field('ocean_model', 'hrmu', diag%axesCuL, Time, &
+      'Contribution from Horizontal Residual Mean to thickness fluxes to advect tracers', 'kg', &
+      y_cell_method='sum', v_extensive=.true.)
+  CS%id_hrmv = register_diag_field('ocean_model', 'hrmv', diag%axesCvL, Time, &
+      'Contribution from Horizontal Residual Mean to thickness fluxes to advect tracers', 'kg', &
+      x_cell_method='sum', v_extensive=.true.)
+
 end subroutine thickness_diffuse_init
 
 !> Deallocate the thickness diffusion control structure
@@ -1911,5 +1934,562 @@ end subroutine thickness_diffuse_end
 !! Viscbeck, M., J.C. Marshall, H. Jones, 1996:
 !! On he dynamics of convective "chimneys" in the ocean. J. Phys. Oceangr., 26, 1721-1734.
 !! http://dx.doi.org/10.1175/1520-0485(1996)026%3C1721:DOICRI%3E2.0.CO;2
+
+!!! HRM
+subroutine HRM_transport(G,GV,h,e,tv,u,v,CS,dt,HRMu,HRMv,slope_x,slope_y)
+  type(ocean_grid_type),                       intent(in)  :: G        !< Ocean grid structure
+  type(verticalGrid_type),                     intent(in)  :: GV       !< Vertical grid structure
+  real, dimension(SZI_(G),SZJ_(G),SZK_(G)),    intent(in)  :: h        !< Layer thickness (m or kg/m2)
+  real, dimension(SZI_(G),SZJ_(G),SZK_(G)+1),  intent(in)  :: e        !< Interface positions (m) 
+  type(thermo_var_ptrs),                       intent(in)  :: tv       !< Thermodynamics structure
+  real,                                        intent(in)  :: dt       !< Time increment (s)
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(G)), intent(inout) :: u
+  real, dimension(SZI_(G),SZJB_(G),SZK_(G)), intent(inout) :: v
+  type(thickness_diffuse_CS),                pointer       :: CS       !< Control structure for thickness diffusion
+
+  ! type(MOM_state_type),                        pointer  :: MOM_CS   !< Control structure from initialize_MOM
+  real, dimension(SZI_(G),SZJ_(G),SZK_(G)), intent(out) :: HRMu       !< Zonal HRM transport
+  real, dimension(SZI_(G),SZJ_(G),SZK_(G)), intent(out) :: HRMv       !< Meridional HRM transport
+ 
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(G)+1), optional, intent(in)  :: slope_x  !< Zonal isopycnal at (I,j,K)
+  real, dimension(SZI_(G),SZJB_(G),SZK_(G)+1), optional, intent(in)  :: slope_y  !< Meridional isopycnal at (i,J,K)
+ 
+ 
+  !Local variables
+  integer  :: i,j,k,is,ie,js,je,nz,IsdB
+
+  real, dimension(SZI_(G), SZJ_(G), SZK_(G)) :: &
+    T, &          ! The temperature (or density) in C, with the values in
+                  ! in massless layers filled vertically by diffusion.
+    S         ! The filled salinity, in PSU, with the values in
+                  ! in massless layers filled vertically by diffusion.
+  
+  real :: sl_c          ! Slope of the coordinate
+  real :: H_to_m        ! Local copies of unit conversion factors.
+  real :: h_neglect     ! A thickness that is so small it is usually lost in roundoff and can be neglected, in H.
+  real :: h_neglect2    ! h_neglect^2, in H2.
+  real :: dz_neglect    ! A thickness in m that is so small it is usually lost
+                        ! in roundoff and can be neglected, in m.
+  real :: wtA, wtB, wtL, wtR
+  real :: drdiA, drdiB  ! Along layer zonal- and meridional- potential density
+  real :: drdjA, drdjB  ! gradients in the layers above (A) and below(B) the
+                        ! interface times the grid spacing, in kg m-3.
+  real :: drdkL, drdkR  ! Vertical density differences across an interface,
+                        ! in kg m-3.
+  real :: drdx, drdy, drdz  ! Zonal, meridional, and vertical density gradients,
+                        ! in units of kg m-4.
+  real :: dzaL, dzaR
+  real :: hg2A, hg2B, hg2L, hg2R
+  real :: haA, haB, haL, haR
+  real :: mag_grad2     ! The squared magnitude of the 3-d density gradient, in kg2 m-8.
+  real :: slope_max           !< Slopes steeper than slope_max are limited in some way.
+
+  real, dimension(SZIB_(G)) :: &
+    T_u, S_u, &   ! Temperature, salinity, and pressure on the interface at
+    pres_u        ! the u-point in the horizontal.
+  real, dimension(SZI_(G)) :: &
+    T_v, S_v, &   ! Temperature, salinity, and pressure on the interface at
+    pres_v        ! the v-point in the horizontal.
+
+  real, dimension(SZI_(G), SZJ_(G), SZK_(G)+1) :: pres ! The pressure at an interface, in Pa.
+  real, dimension(SZIB_(G)) :: &
+    drho_dT_u, &  ! The derivatives of density with temperature and
+    drho_dS_u     ! salinity at u points, in kg m-3 K-1 and kg m-3 psu-1.
+  real, dimension(SZI_(G)) :: &
+    drho_dT_v, &  ! The derivatives of density with temperature and
+    drho_dS_v     ! salinity at v points, in kg m-3 K-1 and kg m-3 psu-1.
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(G)+1) :: slopex  !< Zonal isopycnal at (I,j,K)
+  real, dimension(SZI_(G),SZJB_(G),SZK_(G)+1) :: slopey  !< Meridional isopycnal at (i,J,K)
+
+  logical :: &
+       bd_flag, &          ! Boundary detection, if at boundary, bd_flag = 1.0
+       present_slope_x, &  
+       present_slope_y
+
+  logical :: use_EOS    ! If true, density is calculated from T & S using an
+       ! equation of state.
+
+  !real, dimension(SZIB_(G),SZJ_(G),SZK_(G))  :: &
+  ! L_u   &    ! The difference between ntp and the slope of the interface above in x direction.
+  ! hs_u  &    ! The harmonic average of thickness of ntp for zonal HRM
+
+  real, dimension(SZI_(G),SZJ_(G),SZK_(G))  :: &
+       L_v,   &    ! The difference between ntp and the slope of the interface above in x direction. 
+       hs_v,  &    ! The harmonic average of thickness of ntp for meridional HRM
+       hv,    &    ! The harmonic average of thickness of zonal shear
+       hz_v,  &    ! The harmonic average of thickness of the same layer for calculating v_z
+       del_v, &    ! The zonal shear
+       Lx,    &    ! The thickness weighted slope difference
+       v_x,   &    ! The thickness weighted zonal shear
+       v_z,   &    ! The thickness weighted vertical shear
+       HRM1,  &    ! The zonal shear term in HRMv
+       HRM2,  &    ! The vertical shear term in HRMv
+       HRM3,  &    ! The east-west term in HRMv
+       HRM4,   &    ! The height adjustment term in HRMv
+       L_u,   &    ! The difference between ntp and the slope of the interface above in y direction. 
+       hs_u,  &    ! The harmonic average of thickness of ntp for zonal HRM
+       hu,    &    ! The harmonic average of thicknees of moridional shear
+       hz_u,  &    ! The harmonic average of thickness of the same layer for calculating u_z
+       del_u, &    ! The meridional shear
+       Ly,    &    ! The thickness weighted slope difference
+       u_y,   &    ! The thickness weighted zonal shear
+       u_z,   &    ! The thickness weighted vertical shear
+       HRM1u, &    ! The zonal shear term in HRMu
+       HRM2u, &    ! The vertical shear term in HRMu
+       HRM3u, &    ! The east-west term in HRMu
+       HRM4u       ! The height adjustment term in HRMu
+
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = G%ke ; IsdB = G%IsdB
+  
+  h_neglect = GV%H_subroundoff ; h_neglect2 = h_neglect**2
+  
+  H_to_m = GV%H_to_m
+
+  dz_neglect = GV%H_subroundoff*H_to_m
+
+  slope_max = CS%slope_max
+
+  HRMv = 0.0
+  HRM1 = 0.0
+  HRM2 = 0.0
+  HRM3 = 0.0
+  HRM4 = 0.0
+  slopex = slope_max
+  slopey = slope_max
+
+  present_slope_x = PRESENT(slope_x)
+  present_slope_y = PRESENT(slope_y)
+  use_EOS = associated(tv%eqn_of_state)
+
+  print*, 'associated(tv%eqn_of_state): ', associated(tv%eqn_of_state)
+  print*, 'tv%T', tv%T(2, 3, 4)
+
+  if (use_EOS) then
+    call vert_fill_TS(h, tv%T, tv%S, CS%kappa_smooth, dt, T, S, G, GV, 1)
+  endif
+
+  do j=js-1,je+1 ; do i=is-1,ie+1
+    pres(i,j,1) = 0.0  ! ### This should be atmospheric pressure.
+    pres(i,j,2) = pres(i,j,1) + GV%H_to_Pa*h(i,j,1)
+  enddo ; enddo
+  
+  
+  if (.not. present_slope_x) then
+    do j = js,je
+      do k = nz,2,-1
+        ! Calculate the zonal fluxes and gradients.
+        if (use_EOS) then
+          do I=is-1,ie
+            pres_u(I) = 0.5*(pres(i,j,K) + pres(i+1,j,K))
+            T_u(I) = 0.25*((T(i,j,k) + T(i+1,j,k)) + (T(i,j,k-1) + T(i+1,j,k-1)))
+            S_u(I) = 0.25*((S(i,j,k) + S(i+1,j,k)) + (S(i,j,k-1) + S(i+1,j,k-1)))
+          enddo
+          call calculate_density_derivs(T_u, S_u, pres_u, drho_dT_u, &
+                     drho_dS_u, (is-IsdB+1)-1, ie-is+2, tv%eqn_of_state)
+        endif
+
+
+        do i = is-1,ie
+          
+          ! Estimate the horizontal density gradients along layers.
+          drdiA = drho_dT_u(I) * (T(i+1,j,k-1)-T(i,j,k-1)) + &
+                  drho_dS_u(I) * (S(i+1,j,k-1)-S(i,j,k-1))
+          drdiB = drho_dT_u(I) * (T(i+1,j,k)-T(i,j,k)) + &
+                  drho_dS_u(I) * (S(i+1,j,k)-S(i,j,k))
+
+          ! Estimate the vertical density gradients times the grid spacing.
+          drdkL = (drho_dT_u(I) * (T(i,j,k)-T(i,j,k-1)) + &
+                   drho_dS_u(I) * (S(i,j,k)-S(i,j,k-1)))
+          drdkR = (drho_dT_u(I) * (T(i+1,j,k)-T(i+1,j,k-1)) + &
+                   drho_dS_u(I) * (S(i+1,j,k)-S(i+1,j,k-1)))
+          
+          hg2L = h(i,j,k-1)*h(i,j,k) + h_neglect2
+          hg2R = h(i+1,j,k-1)*h(i+1,j,k) + h_neglect2
+          haL = 0.5*(h(i,j,k-1) + h(i,j,k)) + h_neglect
+          haR = 0.5*(h(i+1,j,k-1) + h(i+1,j,k)) + h_neglect
+          if (GV%Boussinesq) then
+            dzaL = haL * H_to_m ; dzaR = haR * H_to_m
+          else
+            dzaL = 0.5*(e(i,j,K-1) - e(i,j,K+1)) + dz_neglect
+            dzaR = 0.5*(e(i+1,j,K-1) - e(i+1,j,K+1)) + dz_neglect
+          endif
+
+          ! Use the harmonic mean thicknesses to weight the horizontal gradients.
+          ! These unnormalized weights have been rearranged to minimize divisions.
+          wtL = hg2L*(haR*dzaR) ; wtR = hg2R*(haL*dzaL)
+
+          drdz = (wtL * drdkL + wtR * drdkR) / (dzaL*wtL + dzaR*wtR)
+          ! The expression for drdz above is mathematically equivalent to:
+          !   drdz = ((hg2L/haL) * drdkL/dzaL + (hg2R/haR) * drdkR/dzaR) / &
+          !          ((hg2L/haL) + (hg2R/haR))
+          hg2A = h(i,j,k-1)*h(i+1,j,k-1) + h_neglect2
+          hg2B = h(i,j,k)*h(i+1,j,k) + h_neglect2
+          haA = 0.5*(h(i,j,k-1) + h(i+1,j,k-1)) + h_neglect
+          haB = 0.5*(h(i,j,k) + h(i+1,j,k)) + h_neglect
+
+          ! Use the harmonic mean thicknesses to weight the horizontal gradients.
+          ! These unnormalized weights have been rearranged to minimize divisions.
+          wtA = hg2A*haB ; wtB = hg2B*haA
+          ! This is the gradient of density along geopotentials.
+          drdx = ((wtA * drdiA + wtB * drdiB) / (wtA + wtB) - &
+                      drdz * (e(i,j,K)-e(i+1,j,K))) * G%IdxCu(I,j)
+
+          ! This estimate of slope is accurate for small slopes, but bounded
+          ! to be between -1 and 1.
+          mag_grad2 = drdx**2 + drdz**2
+          if (mag_grad2 > 0.0) then
+            slopex(I,j,K) = drdx / sqrt(mag_grad2)
+          
+          else ! Just in case mag_grad2 = 0 ever.
+            slopex(I,j,K) = 0.0
+          
+          endif
+
+          if (slopex(I,j,K) > slope_max) then
+            slopex(I,j,K) = slope_max
+          elseif (-slopex(I,j,K) > slope_max) then
+            slopex(I,j,K) = - slope_max
+          endif
+
+        enddo
+
+      enddo
+    enddo
+  else
+    slopex = slope_x
+  endif
+
+  if (.not. present_slope_y) then
+    do J = js-1,je
+      do k = nz,2,-1
+        if (use_EOS) then
+          do i=is,ie
+            pres_v(i) = 0.5*(pres(i,j,K) + pres(i,j+1,K))
+            T_v(i) = 0.25*((T(i,j,k) + T(i,j+1,k)) + (T(i,j,k-1) + T(i,j+1,k-1)))
+            S_v(i) = 0.25*((S(i,j,k) + S(i,j+1,k)) + (S(i,j,k-1) + S(i,j+1,k-1)))
+          enddo
+          call calculate_density_derivs(T_v, S_v, pres_v, drho_dT_v, &
+                       drho_dS_v, is, ie-is+1, tv%eqn_of_state)
+        endif
+        do i = is,ie
+          ! Estimate the horizontal density gradients along layers.
+          drdjA = drho_dT_v(i) * (T(i,j+1,k-1)-T(i,j,k-1)) + &
+                  drho_dS_v(i) * (S(i,j+1,k-1)-S(i,j,k-1))
+          drdjB = drho_dT_v(i) * (T(i,j+1,k)-T(i,j,k)) + &
+                  drho_dS_v(i) * (S(i,j+1,k)-S(i,j,k))
+
+          ! Estimate the vertical density gradients times the grid spacing.
+          drdkL = (drho_dT_v(i) * (T(i,j,k)-T(i,j,k-1)) + &
+                   drho_dS_v(i) * (S(i,j,k)-S(i,j,k-1)))
+          drdkR = (drho_dT_v(i) * (T(i,j+1,k)-T(i,j+1,k-1)) + &
+                   drho_dS_v(i) * (S(i,j+1,k)-S(i,j+1,k-1)))
+          hg2L = h(i,j,k-1)*h(i,j,k) + h_neglect2
+          hg2R = h(i,j+1,k-1)*h(i,j+1,k) + h_neglect2
+          haL = 0.5*(h(i,j,k-1) + h(i,j,k)) + h_neglect
+          haR = 0.5*(h(i,j+1,k-1) + h(i,j+1,k)) + h_neglect
+          if (GV%Boussinesq) then
+            dzaL = haL * H_to_m ; dzaR = haR * H_to_m
+          else
+            dzaL = 0.5*(e(i,j,K-1) - e(i,j,K+1)) + dz_neglect
+            dzaR = 0.5*(e(i,j+1,K-1) - e(i,j+1,K+1)) + dz_neglect
+          endif
+          ! Use the harmonic mean thicknesses to weight the horizontal gradients.
+          ! These unnormalized weights have been rearranged to minimize divisions.
+          wtL = hg2L*(haR*dzaR) ; wtR = hg2R*(haL*dzaL)
+     
+           drdz = (wtL * drdkL + wtR * drdkR) / (dzaL*wtL + dzaR*wtR)
+           ! The expression for drdz above is mathematically equivalent to:
+           !   drdz = ((hg2L/haL) * drdkL/dzaL + (hg2R/haR) * drdkR/dzaR) / &
+           !          ((hg2L/haL) + (hg2R/haR))
+          hg2A = h(i,j,k-1)*h(i,j+1,k-1) + h_neglect2
+          hg2B = h(i,j,k)*h(i,j+1,k) + h_neglect2
+          haA = 0.5*(h(i,j,k-1) + h(i,j+1,k-1)) + h_neglect
+          haB = 0.5*(h(i,j,k) + h(i,j+1,k)) + h_neglect
+
+          ! Use the harmonic mean thicknesses to weight the horizontal gradients.
+          ! These unnormalized weights have been rearranged to minimize divisions.
+          wtA = hg2A*haB ; wtB = hg2B*haA
+          ! This is the gradient of density along geopotentials.
+          drdy = ((wtA * drdjA + wtB * drdjB) / (wtA + wtB) - &
+                      drdz * (e(i,j,K)-e(i,j+1,K))) * G%IdyCv(i,J)
+          ! This estimate of slope is accurate for small slopes, but bounded
+          ! to be between -1 and 1.
+          mag_grad2 = drdy**2 + drdz**2
+          if (mag_grad2 > 0.0) then
+            slopey(i,J,K) = drdy / sqrt(mag_grad2)
+                
+          else ! Just in case mag_grad2 = 0 ever.
+            slopey(i,J,K) = 0.0
+            
+          endif
+
+          if (slopey(i,J,K) > slope_max) then
+            slopey(i,J,K) = slope_max
+          elseif (-slopey(i,J,K) > slope_max) then
+            slopey(i,J,K) = - slope_max
+          endif
+
+        enddo
+      enddo
+    enddo
+  else
+      slopey = slope_y
+  endif
+
+
+     
+  hs_v = 0.0
+  L_v = 0.0
+  hv = 0.0
+  del_v = 0.0
+
+  ! Meridional HRM
+  ! Harmonic Average
+  do k = 2,nz
+     do j = js,je
+        do i = is,ie
+           ! thickness-weighted slope 
+           hs_v(I,j,K) = 4.0*h(i,j,k)*h(i+1,j,k)*h(i,j,k-1)*h(i+1,j,k-1)/ &
+                ( h(i,j,k)*h(i+1,j,k)*( h(i,j,k-1)+h(i+1,j,k-1) )+ &
+                ( h(i,j,k)+h(i+1,j,k) )*h(i,j,k-1)*h(i+1,j,k-1) + h_neglect )
+           sl_c =  (e(i+1,j,K) - e(i,j,K)) * G%IdxCu(I,j)
+           
+          
+           L_v(I,j,K) = slopex(I,j,K) - sl_c  ! slope of neutral tagent plane - slope of coordinate
+
+           ! thickness-weighted shear
+           hv(I,J,k) =  4.0*h(i,j,k)*h(i+1,j,k)*h(i,j+1,k)*h(i+1,j+1,k)/ &
+                ( h(i,j,k)*h(i+1,j,k)*( h(i,j+1,k)+h(i+1,j+1,k) )+ &
+                ( h(i,j,k)+h(i+1,j,k) )*h(i,j+1,k)*h(i+1,j+1,k) + h_neglect )
+           del_v(I,J,k) = v(i+1,J,k) - v(i,J,k)
+           
+        enddo
+     enddo
+  enddo
+
+
+  
+  Lx = 0.0
+  v_x = 0.0
+  v_z = 0.0
+  hz_v = 0.0
+  !Thickness weighted slopes and shears
+  bd_flag = .false. ! If detected boundary, then bd_flag = 1.0
+  do k = 2,nz
+     do j = js,je
+        do i = is,ie
+           Lx(I,J,K) = ( hs_v(I,j,K)*L_v(I,j,K) + hs_v(I,j+1,K)*L_v(I,j+1,K))/ (hs_v(I,j,K) + hs_v(I,j+1,K) + h_neglect)
+           v_x(I,J,K) = ( (hv(I,J,k)*del_v(I,J,k)+hv(I,J,k-1)*del_v(I,J,k-1))/ (hv(I,J,k) + hv(I,J,k-1)+h_neglect) ) * &
+                G%IdxBu(I,J)
+          ! Calculate v_z
+          hz_v(i,J,k) = 2*h(i,j,k)*h(i,j+1,k)/ (h(i,j,k) + h(i,j+1,k) + h_neglect )
+          if ( (hz_v(i,J,k) + hz_v(i,J,k-1))< 1.0 ) then
+            v_z(i,J,K) = 0.0
+          else
+            v_z(i,J,K) = ( v(i,J,k-1) - v(i,J,k) )/( 0.5*hz_v(i,J,k) + 0.5*hz_v(i,J,k-1) + h_neglect)
+          endif
+          
+           ! Boundary check
+            if (bd_flag .EQ. .false.) then
+              ! Check slope
+              if ( (hs_v(I,j,K) < 2*h_neglect) .AND. (hs_v(I,j+1,K) < 2*h_neglect) ) then 
+                 if ( Lx(I-1,J,K) > 2*h_neglect ) then !estern boundary
+                    Lx(I,J,K) = Lx(I-1,J,K)
+                    bd_flag = .true.
+                 endif
+              elseif ( Lx(I,J,K) > 2*h_neglect ) then
+                 if ( (hs_v(I-1,j,K) < 2*h_neglect ) .AND. (hs_v(I-1,j+1,K) < 2*h_neglect)) then ! western boundary
+                    Lx(I-1,J,K) = Lx(I,J,K)
+                    bd_flag = .true.
+                 endif
+              endif
+
+              !Check shear
+              if ( (hv(I,J,k) < 2*h_neglect) .AND. (hv(I,J,k-1) < 2*h_neglect) ) then
+                 if (v_x(I-1,J,K) > 2*h_neglect) then
+                    v_x(I,J,K) = v_x(I-1,J,K)
+                    bd_flag = .true.
+                 endif
+              elseif ( v_x(I,J,K) > 2*h_neglect ) then
+                 if ( (hv(I-1,J,k) < 2*h_neglect) .AND. (hv(I-1,J,k-1) < 2*h_neglect) ) then
+                    v_x(I-1,J,K) = v_x(I,J,K)
+                    bd_flag = .true.
+                 endif
+              endif
+            elseif (bd_flag .EQ. .true.) then
+              bd_flag = .false.
+            endif
+          
+           
+        enddo
+     enddo
+  enddo
+
+  !Meridional HRM terms
+  do k = 2,nz
+     do j = js,je
+        do i= is,ie
+           HRM1(i,J,K) = 1.0/24.0*v_x(I,J,K)*Lx(I,J,K)*(G%dx_Cv(i,J)**3.0)
+           HRM2(i,J,K) = 1.0/48.0*v_z(i,J,K)*(Lx(I,J,K)**2.0)*(G%dx_Cv(i,J)**3.0)
+           HRM3(i,J,K) = - 1.0/64.0*(v_x(I,J,K) - v_x(I-1,J,K))*(Lx(I,J,K)-Lx(I-1,J,K))*(G%dx_Cv(i,J)**3.0)
+           HRM4(i,J,K) = - 1.0/128.0*v_z(i,J,K)*(Lx(I,J,K) - Lx(I-1,J,K))**2.0*(G%dx_Cv(i,J)**3.0)
+        enddo
+     enddo
+  enddo
+
+  !print*, 'v_z: ', minval(v_z(is:ie,js:je,2:)), maxval(v_z(is:ie,js:je,2:))
+  !print*, 'v_x: ', minval(v_x(is:ie,js:je,2:)), maxval(v_x(is:ie,js:je,2:))
+  print*, 'Lx: ', minval(Lx(is:ie,js:je,2:)), maxval(Lx(is:ie,js:je,2:))
+  print*, 'Lv: ', minval(L_v(is:ie,js:je,2:)), maxval(L_v(is:ie,js:je,2:))
+  !print*, 'slopex: ', minval(slopex(is:ie,js:je,2:)), maxval(slopex(is:ie,js:je,2:))
+  !print*, 'sl_c: ', sl_c
+  print*, 'slope_max', slope_max
+  print*, 'HRM1: ', minval(HRM1(is:ie,js:je,2:)), maxval(HRM1(is:ie,js:je,2:))
+  print*, 'HRM2: ', minval(HRM2(is:ie,js:je,2:)), maxval(HRM2(is:ie,js:je,2:))
+  print*, 'HRM3: ', minval(HRM3(is:ie,js:je,2:)), maxval(HRM3(is:ie,js:je,2:))
+  print*, 'HRM4: ', minval(HRM4(is:ie,js:je,2:)), maxval(HRM4(is:ie,js:je,2:))
+
+  do k = 2,nz
+     do j = js,je
+        do i = is,ie
+           HRMv(i,J,K) = HRM1(i,J,K) + HRM1(i-1,J,K) + &
+                HRM2(i,J,K) + HRM2(i-1,J,K) + HRM3(i,J,K) + HRM4(i,J,K)
+        enddo
+     enddo
+  enddo
+
+  do j = js,je
+    do i = is,ie
+      HRMv(i,J,1) = - SUM(HRMv(i,J,2:))
+    enddo
+  enddo
+
+  !print*, 'HRMv w/ halos: ', minval(HRMv), maxval(HRMv)
+  !print*, 'HRMv: ', minval(HRMv(is:ie,js:je,:)), maxval(HRMv(is:ie,js:je,:))
+
+  hs_u = 0.0
+  L_u = 0.0
+  hu = 0.0
+  del_u =0.0
+
+  ! Zonal HRM
+  ! Harmonic Average
+  do k = 2,nz
+    do j = js,je
+       do i = is,ie
+          ! thickness-weighted slope 
+          hs_u(i,J,K) = 4.0*h(i,j,k)*h(i,j+1,k)*h(i,j,k-1)*h(i,j+1,k-1)/ &
+               ( h(i,j,k)*h(i,j+1,k)*( h(i,j,k-1)+h(i,j+1,k-1) )+ &
+               ( h(i,j,k)+h(i,j+1,k) )*h(i,j,k-1)*h(i,j+1,k-1) + h_neglect )
+          sl_c =  (e(i,j,K) - e(i,j+1,K)) * G%IdyCu(i,J)
+          
+         
+          L_u(i,J,K) = slopey(i,J,K) - sl_c  ! slope of neutral tagent plane - slope of coordinate
+
+          ! thickness-weighted shear
+          hu(I,J,k) =  4.0*h(i,j,k)*h(i+1,j,k)*h(i,j+1,k)*h(i+1,j+1,k)/ &
+               ( h(i,j,k)*h(i+1,j,k)*( h(i,j+1,k)+h(i+1,j+1,k) )+ &
+               ( h(i,j,k)+h(i+1,j,k) )*h(i,j+1,k)*h(i+1,j+1,k) + h_neglect )
+          del_u(I,J,k) = u(I,j+1,k) - u(I,j,k)
+          
+       enddo
+    enddo
+ enddo
+
+  Ly = 0.0
+  u_y = 0.0
+  u_z = 0.0
+  hz_u = 0.0
+  !Thickness weighted slopes and shears
+  bd_flag = .false. ! If detected boundary, then bd_flag = 1.0
+  do k = 2,nz
+     do j = js,je
+        do i = is,ie
+           Ly(I,J,K) = ( hs_u(i,J,K)*L_u(i,J,K) + hs_u(i+1,J,K)*L_u(i+1,J,K))/ (hs_u(i,J,K) + hs_u(i+1,J,K) + h_neglect)
+           u_y(I,J,K) = ( (hu(I,J,k)*del_u(I,J,k)+hu(I,J,k-1)*del_u(I,J,k-1))/ (hu(I,J,k) + hu(I,J,k-1)+h_neglect) ) * &
+                G%IdyBu(I,J)
+          ! Calculate u_z
+          hz_u(I,j,k) = 2*h(i,j,k)*h(i+1,j,k)/ (h(i,j,k) + h(i+1,j,k) + h_neglect )
+          if ( (hz_u(I,j,k) + hz_u(I,j,k-1))< 1.0 ) then
+            u_z(I,j,K) = 0.0
+          else
+            u_z(I,j,K) = ( u(I,j,k-1) - u(I,j,k) )/( 0.5*hz_u(I,j,k) + 0.5*hz_u(I,j,k-1) + h_neglect)
+          endif
+          
+           ! Boundary check
+            if (bd_flag .EQ. .false.) then
+              ! Check slope
+              if ( (hs_u(i,J,K) < 2*h_neglect) .AND. (hs_v(i+1,J,K) < 2*h_neglect) ) then 
+                 if ( Ly(I,J-1,K) > 2*h_neglect ) then !estern boundary
+                    Ly(I,J,K) = Ly(I,J-1,K)
+                    bd_flag = .true.
+                 endif
+              elseif ( Ly(I,J,K) > 2*h_neglect ) then
+                 if ( (hs_u(i,J-1,K) < 2*h_neglect ) .AND. (hs_u(i+1,J-1,K) < 2*h_neglect)) then ! western boundary
+                    Ly(I,J-1,K) = Ly(I,J,K)
+                    bd_flag = .true.
+                 endif
+              endif
+
+              !Check shear
+              if ( (hu(I,J,k) < 2*h_neglect) .AND. (hu(I,J,k-1) < 2*h_neglect) ) then
+                 if (u_y(I,J-1,K) > 2*h_neglect) then
+                    u_y(I,J,K) = u_y(I,J-1,K)
+                    bd_flag = .true.
+                 endif
+              elseif ( u_y(I,J,K) > 2*h_neglect ) then
+                 if ( (hu(I,J-1,k) < 2*h_neglect) .AND. (hu(I,J-1,k-1) < 2*h_neglect) ) then
+                    u_y(I,J-1,K) = u_y(I,J,K)
+                    bd_flag = .true.
+                 endif
+              endif
+            elseif (bd_flag .EQ. .true.) then
+              bd_flag = .false.
+            endif
+          
+           
+        enddo
+     enddo
+  enddo
+
+  !Zonal HRM terms
+  do k = 2,nz
+    do j = js,je
+       do i= is,ie
+          HRM1u(I,j,K) = 1.0/24.0*u_y(I,J,K)*Ly(I,J,K)*(G%dy_Cu(I,j)**3.0)
+          HRM2u(I,j,K) = 1.0/48.0*u_z(I,j,K)*(Ly(I,J,K)**2.0)*(G%dy_Cu(I,j)**3.0)
+          HRM3u(I,j,K) = - 1.0/64.0*(u_y(I,J,K) - u_y(I,J-1,K))*(Ly(I,J,K)-Ly(I,J-1,K))*(G%dy_Cu(i,J)**3.0)
+          HRM4u(I,j,K) = - 1.0/128.0*u_z(I,j,K)*(Ly(I,J,K) - Ly(I,J-1,K))**2.0*(G%dy_Cu(I,j)**3.0)
+       enddo
+    enddo
+ enddo
+
+ !print*, 'v_z: ', minval(v_z(is:ie,js:je,2:)), maxval(v_z(is:ie,js:je,2:))
+ !print*, 'v_x: ', minval(v_x(is:ie,js:je,2:)), maxval(v_x(is:ie,js:je,2:))
+ !print*, 'Ly: ', minval(Lx(is:ie,js:je,2:)), maxval(Lx(is:ie,js:je,2:))
+ !print*, 'Lu: ', minval(L_v(is:ie,js:je,2:)), maxval(L_v(is:ie,js:je,2:))
+ !print*, 'slopex: ', minval(slopex(is:ie,js:je,2:)), maxval(slopex(is:ie,js:je,2:))
+ !print*, 'sl_c: ', sl_c
+ !print*, 'slope_max', slope_max
+ !print*, 'HRM1u: ', minval(HRM1(is:ie,js:je,2:)), maxval(HRM1(is:ie,js:je,2:))
+ !print*, 'HRM2u: ', minval(HRM2(is:ie,js:je,2:)), maxval(HRM2(is:ie,js:je,2:))
+ !print*, 'HRM3u: ', minval(HRM3(is:ie,js:je,2:)), maxval(HRM3(is:ie,js:je,2:))
+ !print*, 'HRM4u: ', minval(HRM4(is:ie,js:je,2:)), maxval(HRM4(is:ie,js:je,2:))
+
+ do k = 2,nz
+    do j = js,je
+       do i = is,ie
+          HRMu(I,j,K) = HRM1u(I,j,K) + HRM1u(I,J-1,K) + &
+               HRM2u(I,j,K) + HRM2u(I,J-1,K) + HRM3u(I,j,K) + HRM4u(I,j,K)
+       enddo
+    enddo
+ enddo
+
+ do j = js,je
+   do i = is,ie
+     HRMu(I,j,1) = - SUM(HRMu(I,j,2:))
+   enddo
+ enddo
+end subroutine HRM_transport
 
 end module MOM_thickness_diffuse
